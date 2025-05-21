@@ -1,0 +1,371 @@
+# React事务处理系统设计方案
+
+## 1. 类型定义
+
+```typescript
+// types.ts
+export enum TransactionState {
+  PENDING = 'PENDING',
+  FULFILLMENT_SUCCESS = 'FULFILLMENT_SUCCESS',
+  FULFILLMENT_FAILED = 'FULFILLMENT_FAILED',
+  MAC_SUCCESS = 'MAC_SUCCESS',
+  MAC_FAILED = 'MAC_FAILED'
+}
+
+export interface OrderResponse {
+  success: boolean;
+  message: string;
+  data?: any;
+}
+
+export interface Transaction {
+  orderId: string;
+  state: TransactionState;
+  timestamp: number;
+  error?: string;
+}
+```
+
+## 2. API服务
+
+```typescript
+// services/api.ts
+import axios from 'axios';
+
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+
+export const api = {
+  async callFulfillmentSystem(orderId: string): Promise<OrderResponse> {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/fulfillment`, { orderId });
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.response?.data?.message || 'Fulfillment system error'
+      };
+    }
+  },
+
+  async callMacSystem(orderId: string): Promise<OrderResponse> {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/mac`, { orderId });
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.response?.data?.message || 'MAC system error'
+      };
+    }
+  },
+
+  async rollbackFulfillment(orderId: string): Promise<OrderResponse> {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/fulfillment/rollback`, { orderId });
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.response?.data?.message || 'Rollback failed'
+      };
+    }
+  }
+};
+```
+
+## 3. 事务管理器Hook
+
+```typescript
+// hooks/useTransaction.ts
+import { useState, useCallback } from 'react';
+import { TransactionState, Transaction, OrderResponse } from '../types';
+import { api } from '../services/api';
+
+export const useTransaction = () => {
+  const [transaction, setTransaction] = useState<Transaction | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const processOrder = useCallback(async (orderId: string) => {
+    setIsLoading(true);
+    setError(null);
+    
+    // 初始化事务
+    setTransaction({
+      orderId,
+      state: TransactionState.PENDING,
+      timestamp: Date.now()
+    });
+
+    try {
+      // 调用 Fulfillment 系统
+      const fulfillmentResult = await api.callFulfillmentSystem(orderId);
+      
+      if (!fulfillmentResult.success) {
+        setTransaction(prev => ({
+          ...prev!,
+          state: TransactionState.FULFILLMENT_FAILED,
+          error: fulfillmentResult.message
+        }));
+        setError(fulfillmentResult.message);
+        return;
+      }
+
+      // 更新 Fulfillment 成功状态
+      setTransaction(prev => ({
+        ...prev!,
+        state: TransactionState.FULFILLMENT_SUCCESS
+      }));
+
+      // 调用 MAC 系统
+      const macResult = await api.callMacSystem(orderId);
+      
+      if (!macResult.success) {
+        // MAC 失败，需要回滚 Fulfillment
+        const rollbackResult = await api.rollbackFulfillment(orderId);
+        
+        setTransaction(prev => ({
+          ...prev!,
+          state: TransactionState.MAC_FAILED,
+          error: macResult.message
+        }));
+        
+        setError(rollbackResult.success 
+          ? macResult.message 
+          : `${macResult.message} (Rollback failed: ${rollbackResult.message})`);
+        return;
+      }
+
+      // 全部成功
+      setTransaction(prev => ({
+        ...prev!,
+        state: TransactionState.MAC_SUCCESS
+      }));
+
+    } catch (error) {
+      setError('System error occurred');
+      setTransaction(prev => ({
+        ...prev!,
+        state: TransactionState.FULFILLMENT_FAILED,
+        error: 'System error occurred'
+      }));
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  return {
+    transaction,
+    isLoading,
+    error,
+    processOrder
+  };
+};
+```
+
+## 4. UI组件
+
+```typescript
+// components/OrderProcessor.tsx
+import React from 'react';
+import { useTransaction } from '../hooks/useTransaction';
+import { TransactionState } from '../types';
+
+export const OrderProcessor: React.FC = () => {
+  const { transaction, isLoading, error, processOrder } = useTransaction();
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const orderId = (e.target as HTMLFormElement).orderId.value;
+    await processOrder(orderId);
+  };
+
+  return (
+    <div className="order-processor">
+      <form onSubmit={handleSubmit}>
+        <input 
+          type="text" 
+          name="orderId" 
+          placeholder="Enter Order ID"
+          disabled={isLoading}
+        />
+        <button type="submit" disabled={isLoading}>
+          {isLoading ? 'Processing...' : 'Process Order'}
+        </button>
+      </form>
+
+      {isLoading && (
+        <div className="loading-indicator">
+          <div className="spinner" />
+          <p>Processing order...</p>
+        </div>
+      )}
+
+      {error && (
+        <div className="error-message">
+          <p>Error: {error}</p>
+        </div>
+      )}
+
+      {transaction && (
+        <div className="transaction-status">
+          <h3>Transaction Status</h3>
+          <p>Order ID: {transaction.orderId}</p>
+          <p>State: {transaction.state}</p>
+          <p>Time: {new Date(transaction.timestamp).toLocaleString()}</p>
+        </div>
+      )}
+    </div>
+  );
+};
+```
+
+## 5. 样式
+
+```css
+/* styles/OrderProcessor.css */
+.order-processor {
+  padding: 20px;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+.loading-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 20px 0;
+}
+
+.spinner {
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #3498db;
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  animation: spin 1s linear infinite;
+  margin-right: 10px;
+}
+
+.error-message {
+  color: #e74c3c;
+  padding: 10px;
+  border: 1px solid #e74c3c;
+  border-radius: 4px;
+  margin: 10px 0;
+}
+
+.transaction-status {
+  margin-top: 20px;
+  padding: 15px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+```
+
+## 6. 主应用
+
+```typescript
+// App.tsx
+import React from 'react';
+import { OrderProcessor } from './components/OrderProcessor';
+import './styles/OrderProcessor.css';
+
+const App: React.FC = () => {
+  return (
+    <div className="app">
+      <h1>Order Processing System</h1>
+      <OrderProcessor />
+    </div>
+  );
+};
+
+export default App;
+```
+
+## 7. 改进建议
+
+### 7.1 重试机制
+```typescript
+const retry = async (fn: () => Promise<any>, retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === retries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
+};
+```
+
+### 7.2 状态持久化
+```typescript
+const persistTransaction = (transaction: Transaction) => {
+  localStorage.setItem(`transaction_${transaction.orderId}`, JSON.stringify(transaction));
+};
+```
+
+### 7.3 WebSocket实时更新
+```typescript
+const useTransactionUpdates = (orderId: string) => {
+  useEffect(() => {
+    const ws = new WebSocket(`ws://your-api/transactions/${orderId}`);
+    ws.onmessage = (event) => {
+      const update = JSON.parse(event.data);
+      // 处理更新
+    };
+    return () => ws.close();
+  }, [orderId]);
+};
+```
+
+## 8. 系统特点
+
+1. **状态管理**
+   - 使用React Hooks管理状态
+   - 清晰的事务状态流转
+   - 错误状态的处理
+
+2. **错误处理**
+   - 完整的错误捕获和处理
+   - 用户友好的错误提示
+   - 回滚机制的错误处理
+
+3. **用户体验**
+   - 加载状态指示
+   - 清晰的交易状态显示
+   - 响应式设计
+
+4. **类型安全**
+   - 使用TypeScript确保类型安全
+   - 清晰的接口定义
+
+5. **可维护性**
+   - 模块化的代码结构
+   - 清晰的关注点分离
+   - 可复用的hooks
+
+## 9. 注意事项
+
+1. 确保API_BASE_URL在环境变量中正确配置
+2. 实现适当的错误处理和日志记录
+3. 考虑添加请求超时处理
+4. 实现适当的加载状态和错误提示
+5. 考虑添加单元测试和集成测试
+6. 实现适当的缓存策略
+7. 考虑添加性能监控 
